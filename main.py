@@ -13,6 +13,8 @@ from scipy.sparse import lil_matrix
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
+from itertools import combinations
+
 from typing import Tuple
 
 
@@ -213,33 +215,83 @@ def refine_camera_poses(rot_mat, pose_mat, color_img_list, cam_calib):
     :return:
     """
 
-    def extract_keypoints(img_list):
+
+    def track_keypoints(img_list):
         # Generate key points and descriptors with ORB for all images and store in a list of dictionaries
         length = len(img_list)
-        orb = cv2.ORB_create()
+        detector = cv2.ORB_create()
+        min_n_features = 300
 
+        mappoints = np.empty(shape=(0, 3))
+        observations = np.empty(shape=(0, 4))
+        kps_ref = np.empty(shape=(0, 2), dtype=np.float32)
 
-        #features = [{'key_points': [],
-        #             'descriptors': np.empty((0, 32))} for i in range(length)]  # Initialise a list of dictionaries
+        # Read first image
+        img_ref = cv2.imread(color_img_list[0], cv2.IMREAD_COLOR)
 
+        #for img_no in tqdm(range(1, length), desc='Keypoint extraction'):
+        for ref_img_no, img_path in enumerate(tqdm(img_list[1:], total=length-1, desc='Keypoint extraction'), start=0):
+            img_track = cv2.imread(img_path, cv2.IMREAD_COLOR)
 
-        # im_no, x, y, des
-        keypoints = np.empty(shape=(0, 35))
-        kp_starts = [0]  # Store the first keypoint index for the corresponding image no.
+            # If the number of tracked keypoints is under the set threshold,
+            # generate new ones and append to existing tracked keypoints
+            if kps_ref.shape[0] < min_n_features:
+                kps_new = detector.detect(image=img_ref, mask=None)
+                kps_new = np.array([x.pt for x in kps_new], dtype=np.float32)
+                kps_ref = np.vstack([kps_ref, kps_new])
 
-        for i in tqdm(range(0, length), desc='Keypoint extraction'):
-            color = cv2.imread(color_img_list[i], cv2.IMREAD_COLOR)
-            kp = orb.detect(color, None)
-            kp, des = orb.compute(color, kp)
+            # Calculate sparse optical flow for the reference keypoints
+            kps_track, status, error = cv2.calcOpticalFlowPyrLK(prevImg=img_ref,
+                                                                nextImg=img_track,
+                                                                prevPts=kps_ref,
+                                                                nextPts=None,
+                                                                winSize=(21, 21),
+                                                                criteria=(cv2.TERM_CRITERIA_EPS |
+                                                                          cv2.TERM_CRITERIA_COUNT, 30, 0.01))
 
-            #features[i]['key_points'] = list(kp)
+            # Keep the valid keypoints pairs and eliminate any duplications
+            kps_ref = kps_ref[status.ravel() == 1]
+            _, ref_unique_idx = np.unique(kps_ref, return_index=True, axis=0)
+            _, track_unique_idx = np.unique(kps_track, return_index=True, axis=0)
+            kps_ref = kps_ref[np.intersect1d(ref_unique_idx, track_unique_idx)]
+            kps_track = kps_track[np.intersect1d(ref_unique_idx, track_unique_idx)]
 
-            keypoints = np.vstack([keypoints, np.hstack([i * np.ones(shape=(len(kp), 1)),
-                                                         np.array([p.pt for p in kp]),
-                                                         des])])
-            kp_starts.append(kp_starts[-1] + len(kp))
+            """
+            At this point a VO would be looking for the Essential/Fundamental matrix and recover the pose change,
+            but we already have that approximate information, so skip that step and log the observations and mappoints
+            """
 
-        return keypoints, kp_starts
+            # For each keypoint find the mappoint if it already has one associated with it when it was tracked before,
+            # or create a new
+
+            for kp_ref, kp_track in zip(kps_ref, kps_track):
+                mappoint_id = observations[np.where((observations[:, 1] == ref_img_no) *
+                                                    (observations[:, 2] == kp_ref[0]) *
+                                                    (observations[:, 3] == kp_ref[1])), 0]
+
+                if mappoint_id.size > 0:
+                    # If the ref keypoint is in the list of existing observations,
+                    # add the track keypoint only to the same mappoint
+
+                    # Mappoint id, reference image id, x, y
+                    observations = np.vstack([observations,
+                                              np.array([float(mappoint_id), ref_img_no + 1,
+                                                        kp_track[0], kp_track[1]], ndmin=2)])
+
+                else:
+                    # Add a new mappoint and the two observations
+                    observations = np.vstack([observations,
+                                              np.array([mappoints.shape[0], ref_img_no, kp_ref[0], kp_ref[1]], ndmin=2),
+                                              np.array([mappoints.shape[0], ref_img_no + 1, kp_track[0], kp_track[1]], ndmin=2)
+                                              ])
+
+                    mappoints = np.vstack([mappoints, np.zeros(shape=(1, 3))])
+
+            observations = np.unique(np.array(sorted(observations, key=lambda x: (x[0]))), axis=0)
+            img_ref = img_track
+            kps_ref = kps_track
+
+        return observations, mappoints
 
     def match_keypoints(keypoints, kp_starts, show_matches=False):
         length = len(kp_starts) - 1
@@ -271,81 +323,32 @@ def refine_camera_poses(rot_mat, pose_mat, color_img_list, cam_calib):
         observations = np.array(sorted(observations, key=lambda x: (x[1], x[2], x[3])))
         return observations, mappoints
 
-    def triangulate_mappoints(observations, cam_calib, mappoints):
+    def triangulate_mappoints(observations, cam_calib, mappoints, pose_mat, rot_mat):
 
-        for keypoint_pair in tqdm(observations.reshape(-1, 8), desc='Triangulating points'):
-            #print(keypoint_pair)
-            t_mtx = np.zeros(shape=(3, 4))
-            t_mtx[:3, :3] = o3d.geometry.get_rotation_matrix_from_axis_angle(rot_mat[int(keypoint_pair[1])])
-            t_mtx[:3, 3] = pose_mat[int(keypoint_pair[1])]
-            proj_1 = cam_calib.intrinsic_matrix @ t_mtx
-            points_1 = keypoint_pair[2:4].transpose()
+        for mappoint in tqdm(np.unique(observations[:, 0]), desc='Triangulating mappoints'):
+            position = np.empty(shape=(0,3))
+            for obs1, obs2 in combinations(observations[observations[:, 0] == mappoint], r=2):
+                t_mtx = np.zeros(shape=(3, 4))
+                t_mtx[:3, :3] = o3d.geometry.get_rotation_matrix_from_axis_angle(rot_mat[int(obs1[1])])
+                t_mtx[:3, 3] = pose_mat[int(obs1[1])]
+                proj_1 = cam_calib.intrinsic_matrix @ t_mtx
+                points_1 = obs1[2:4].transpose()
 
-            t_mtx = np.zeros(shape=(3, 4))
-            t_mtx[:3, :3] = o3d.geometry.get_rotation_matrix_from_axis_angle(rot_mat[int(keypoint_pair[5])])
-            t_mtx[:3, 3] = pose_mat[int(keypoint_pair[5])]
-            proj_2 = cam_calib.intrinsic_matrix @ t_mtx
-            points_2 = keypoint_pair[6:8].transpose()
+                t_mtx = np.zeros(shape=(3, 4))
+                t_mtx[:3, :3] = o3d.geometry.get_rotation_matrix_from_axis_angle(rot_mat[int(obs2[1])])
+                t_mtx[:3, 3] = pose_mat[int(obs2[1])]
+                proj_2 = cam_calib.intrinsic_matrix @ t_mtx
+                points_2 = obs2[2:4].transpose()
 
-            res = cv2.triangulatePoints(projMatr1=proj_1, projMatr2=proj_2, projPoints1=points_1, projPoints2=points_2)
-            mappoints[int(keypoint_pair[0]), :] = cv2.convertPointsFromHomogeneous(res.transpose()).flatten()
+                res = cv2.triangulatePoints(projMatr1=proj_1, projMatr2=proj_2, projPoints1=points_1,
+                                            projPoints2=points_2)
 
-    def merge_mappoints(mappoints, observations):
+                position = np.vstack([position, cv2.convertPointsFromHomogeneous(res.transpose()).flatten()])
 
-        '''
-        Merge mappoints - Keypoints have been discovere and triangulated pair-wise.
-        # Merge observations - Some keypoints may have been registered to multiple mappoints
-        observations = np.array(sorted(observations, key=lambda x: (x[1], x[2], x[3])))  # Keys: image ID, x, y
-        # Return unique values -
-        unique, unique_idx = np.unique(observations[:, 1:], axis=0, return_index=True)
-        '''
+            mappoints[int(mappoint), :] = np.mean(position, axis=0)
 
-        observations = np.array(sorted(observations, key=lambda x: (x[1], x[2], x[3])))  # Keys: image ID, x, y
-        unique, unique_idx = np.unique(observations[:, 1:], axis=0, return_index=True)  # Unique keypoints regardless mappoint id
-        final_mappoint_id_lookup = np.zeros(mappoints.shape[0])
-        for u, unique_id in enumerate(unique_idx[:-1]):
-            i = 0
-            # For each non-unique element mappoint id, change all occurrences of that mappoint id to the
-            # unique element mappoint id.
-            while unique_id+i < observations.shape[0] and unique_id+i < unique_idx[u+1]:
-                current_row = observations[unique_id+i]
-                # Mark into which mappoint is the current mappoint merged
-                final_mappoint_id_lookup[int(current_row[0])] = observations[unique_id, 0]
-                # Set the value of the mappoint id of all observations that share the same value with the current row
-                # to the mappoint id of the last unique row, which is the mappoint it is being merged into
-                observations[observations[:, 0] == current_row[0], 0] = observations[unique_id, 0]
-                i += 1
-    
-        # Average mappoint coordinates over the observed keypoints
-        unique_mappoint_ids = np.unique(observations[:, 0], return_index=False)
-        final_mappoints = np.empty(shape=(0, 3))
-        for id in unique_mappoint_ids:  # Iterate through the merged mappoint ids
-            coords = mappoints[final_mappoint_id_lookup == id]  # Pull all mappoint coords with the merged id
-            # Add the final mappoint with the mean coordinates
-            final_mappoints = np.vstack([final_mappoints, np.mean(coords, axis=0)])
-    
-        mappoints = final_mappoints
-    
-        # Replace the old mappoint ids in the observations with the new ones
-        # There's probably a more numpy way of doing this than a for loop that I can't think of right now
-        for new_id, old_id in enumerate(unique_mappoint_ids):
-            observations[observations[:, 0] == old_id, 0] = new_id
-    
-        # Discard duplicate observations of the same merged mappoint in images
-        unique, unique_ids = np.unique(observations[:, :2], return_index=True, axis=0)
-        observations = observations[unique_ids]
+        return mappoints
 
-        '''
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(mappoints)
-
-        vis = o3d.visualization.Visualizer()
-        vis.create_window()
-        vis.add_geometry(pcd, reset_bounding_box=True)
-        vis.run()
-        '''
-
-        return observations, mappoints
 
     def jacobian_sparsity(observations):
         """
@@ -423,13 +426,14 @@ def refine_camera_poses(rot_mat, pose_mat, color_img_list, cam_calib):
         return ret
 
     # Extract keypoints
-    keypoints, kp_starts = extract_keypoints(img_list=color_img_list)
+    observations, mappoints = track_keypoints(img_list=color_img_list)
 
     # Match keypoints
-    observations, mappoints = match_keypoints(keypoints=keypoints, kp_starts=kp_starts)
+    #observations, mappoints = match_keypoints(keypoints=keypoints, kp_starts=kp_starts)
 
     # Triangulate
-    triangulate_mappoints(observations=observations, cam_calib=cam_calib, mappoints=mappoints)
+    mappoints = triangulate_mappoints(observations=observations, cam_calib=cam_calib, mappoints=mappoints,
+                                      pose_mat=pose_mat, rot_mat=rot_mat)
 
     # Merge mappoints - disabled as it's unclear whether it improves results
     #observations, mappoints = merge_mappoints(mappoints=mappoints, observations=observations)
@@ -498,10 +502,10 @@ def main():
     # Data dir with '/' at the end
     data_path = '/home/attila/Datasets/Remy'
 
-    # Frame processing window
+
     start = 0
     end = 195
-    step = 5
+    step = 1
 
     # Parse scanner log and load position and rotation data
     pose_data = np.genfromtxt(f'{data_path}/scanner.log', delimiter=' ', usecols=range(2, 8))
@@ -520,7 +524,7 @@ def main():
                                                   cx=323.035, cy=242.229)
 
     # Perform an initial reconstruction with the provided data and inspect results
-    reconstruct(pose_mat, rot_mat, color_img_list, depth_img_list, cam_calib=cam_calib, visualise=True)
+    #reconstruct(pose_mat, rot_mat, color_img_list, depth_img_list, cam_calib=cam_calib, visualise=True)
 
     # Generate segmentation masks for the mug to isolate the reconstruction from the background
     # seg_mask_list = generate_seg_masks(output_dir=data_path)
