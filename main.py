@@ -1,31 +1,91 @@
-import numpy as np
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+# Author: Attila Fodor
+# Date: 14 Jan 2022
+
+"""Creates a reconstruction of the scene by reprojecting the image-depthmap pairs using the camera calibration
+ parameters and camera position information.
+
+The code makes several attempts to improve the depthmaps, the camera positions and the final alignment of the
+ pointclouds, with (very) limited success. These techniques are based on some form of block matching that don't
+ work particularly well in the example scene, due to the low camera resolution, featureless surface, glossy object
+ and generally low quality images.
+
+While this was anticipated, not starting with these steps makes little sense, as more sophisticated methods don't
+ guarantee success either. To rule out the possibility that this was due to bad implementation I used Colmap to
+ create a baseline reconstruction, which was not better at all, as Colmap failed to align about half of the camera
+ images. In a practical application the scene can be improved by better lighting, using a higher resolution camera(s),
+ or using learned approaches.
+
+I haven't explored these as it's difficult to estimate how much time it takes to get them to work on a custom dataset,
+ even though these might vastly improve the reconstruction accuracy. One notable work is [RoutedFusion: Learning
+ Real-time Depth Map Fusion](https://www.silvanweder.com/publications/routed-fusion/) that proposes the fusion of
+ depth maps loaded with non-gaussian noise, which could prepare the scene for an ICP step very well. Learned 3D
+ reconstruction from images has improved a lot on the past few years as well, from
+ [Learning Efficient Point Cloud Generation for Dense 3D Object Reconstruction](https://arxiv.org/pdf/1706.07036.pdf)
+ to [3D Reconstruction of Novel Object Shapes from Single Images](https://arxiv.org/pdf/2006.07752.pdf), which could
+ work exceptionally well on simple, featureless shapes compared to classical reconstruction methods.
+
+The main() function demonstrates the usage of the code, and the class/function docstrings explain the reasoning behind
+ the chosen approaches and their implementation details.
+"""
 import cv2
 import open3d as o3d
-import logging
+import numpy as np
 
 from copy import copy
 from time import sleep
+from itertools import combinations
+import matplotlib.pyplot as plt
 
 from scipy.spatial.transform import Rotation
 from scipy.optimize import least_squares
 from scipy.sparse import lil_matrix
-
-import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-from itertools import combinations
-
-from typing import Tuple
+import numpy.typing as npt
+from typing import List
 
 
 class PointCloudAligner(object):
-    def __init__(self, cam_calib):
+    """
+    Takes color images, depth maps and camera positions and creates an aligned reprojection of pointcloud fragments
+    """
+    def __init__(self, cam_calib: o3d.camera.PinholeCameraIntrinsic) -> None:
+        """
+        Inits a PointCloudAligner with camera calibration parameters.
+
+        Args:
+            cam_calib: Intrinsic camera calibration parameters without distortions
+        """
         self.cam_calib = cam_calib
 
         self.vis = None
-        self.pcd = None
+        self.pcd = o3d.geometry.PointCloud()
 
-    def reproject(self, image, depth_map, translation=None, rotation=None, transformation=None):
+    def reproject(self, image: npt.NDArray[np.uint8], depth_map: npt.NDArray[np.uint16],
+                  translation: npt.NDArray[np.float64] = None, rotation: npt.NDArray[np.float64] = None,
+                  transformation: npt.NDArray[np.float64] = None) -> o3d.geometry.PointCloud:
+        """
+        Reproject a depth map and image to a colored 3D pointcloud, rotates it to position.
+
+        Reprojection uses the object camera calibration parameters.
+        If transformation parameter is provided, rotation and translation has no effect. If neither transformation,
+         rotation or translation is provided, assumes identity transformation.
+        Both stores the pointcloud in self and returns it as a new object - both can be used depending on the
+         visualisation requirements (self supports updating, new object supports adding)
+
+        Args:
+            image: RGB color image
+            depth_map: Depth map corresponding to the color image
+            transformation: 4x4 combined rotation and translation matrix
+            translation: 3x1 translation vector
+            rotation: 3x1 rotation vector in axis-angle representation. Rotation angle equals to vector norm.
+
+        Returns:
+            Reprojected and transformed pointcloud.
+        """
         _image = o3d.geometry.Image(image)
         _depth_map = o3d.geometry.Image(depth_map)
         depth_image = o3d.geometry.RGBDImage.create_from_color_and_depth(color=o3d.geometry.Image(image),
@@ -33,6 +93,7 @@ class PointCloudAligner(object):
                                                                          depth_scale=1000, depth_trunc=0.6,
                                                                          convert_rgb_to_intensity=True)
 
+        # Build transformation matrix
         if transformation is not None:
             t_mtx = transformation
         else:
@@ -42,55 +103,69 @@ class PointCloudAligner(object):
             if translation is not None:
                 t_mtx[:3, 3] = translation
 
-        # Need to track the pcd in the same pointer otherwise the visualisation update doesn't work...
         _pcd = o3d.geometry.PointCloud.create_from_rgbd_image(image=depth_image,
                                                               intrinsic=self.cam_calib)
 
+        # Apply transformation
         _pcd.transform(t_mtx)
 
-        try:
-            self.pcd.points = _pcd.points
-            self.pcd.colors = _pcd.colors
-        except AttributeError:
-            self.pcd = _pcd
+        # Need to track the pcd in the same pointer otherwise the visualisation update doesn't work...
+        self.pcd.points = _pcd.points
+        self.pcd.colors = _pcd.colors
 
         return _pcd
 
-    def visualise(self, pcd):
+    def visualise(self, pcd: o3d.geometry.PointCloud = None, update: bool = False) -> None:
+        """
+        Opens a window and visualises the pointcloud.
+
+        Args:
+            pcd: The pointcloud to visualise.
+            update: If True, updates the visualisation of the pointcloud stored in self.pcd
+        """
         if not self.vis:
             self.vis = o3d.visualization.Visualizer()
             self.vis.create_window()
             self.vis.add_geometry(self.pcd, reset_bounding_box=True)
-            self.ctr = self.vis.get_view_control()
         else:
-            self.vis.add_geometry(pcd)
-            #self.vis.update_geometry(self.pcd)
+            if pcd:
+                self.vis.add_geometry(pcd)
+            if update:
+                self.vis.update_geometry(self.pcd)
             self.vis.poll_events()
             self.vis.update_renderer()
 
-    def close_window(self):
+    def close_window(self) -> None:
+        """
+        Convenience function to close the window if required
+        """
         self.vis.destroy_window()
 
 
-def reconstruct(pose_mat, rot_mat, color_img_list, depth_img_list, cam_calib, visualise):
+def reconstruct(pose_mat: npt.NDArray[np.float64], rot_mat: npt.NDArray[np.float64], color_img_list: List[str],
+                depth_img_list: List[str], cam_calib: o3d.geometry.PointCloud,
+                visualise: bool = False) -> o3d.geometry.PointCloud:
     """
-    Reproject the depth maps to 3D and align the fragments using the camera pose and orientation data
+    Feeds images and corresponding position data to a PointCloudAligner object to reconstruct a scene using the
+     available data.
 
-    :param pose_mat:
-    :param rot_mat:
-    :param color_img_list:
-    :param depth_img_list:
-    :param visualise:
-    :return: The complete reconstruction pointcloud
+    Args:
+        pose_mat: nx3 array of translation vectors
+        rot_mat: nx3 array of rotation vectors in axis-angle representation. Rotation angle equals to vector norm
+        color_img_list: List of strings to the paths of the color images
+        depth_img_list: List of strings to the paths of the depth images
+        cam_calib: Intrinsic camera calibration parameters without distortions
+        visualise: Open a window and visualise the resulting pointcloud
+
+    Returns:
+        The aligned pointcloud
     """
-
-    length = len(color_img_list)
-
     aligner = PointCloudAligner(cam_calib=cam_calib)
+    pcd = o3d.geometry.PointCloud()
 
     for i, (color_path, depth_path) in enumerate(zip(color_img_list, depth_img_list)):
-        color = cv2.imread(color_img_list[i], cv2.IMREAD_COLOR)
-        depth = cv2.imread(depth_img_list[i], cv2.IMREAD_UNCHANGED)
+        color = cv2.imread(color_path, cv2.IMREAD_COLOR)
+        depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
 
         pcd = aligner.reproject(image=color, depth_map=depth, rotation=rot_mat[i, :], translation=pose_mat[i, :])
         if visualise:
@@ -99,7 +174,7 @@ def reconstruct(pose_mat, rot_mat, color_img_list, depth_img_list, cam_calib, vi
     if visualise:
         aligner.vis.run()
 
-    return None  # Merged pointcloud
+    return pcd
 
 
 def color_icp():
@@ -524,7 +599,7 @@ def main():
                                                   cx=323.035, cy=242.229)
 
     # Perform an initial reconstruction with the provided data and inspect results
-    #reconstruct(pose_mat, rot_mat, color_img_list, depth_img_list, cam_calib=cam_calib, visualise=True)
+    reconstruct(pose_mat, rot_mat, color_img_list, depth_img_list, cam_calib=cam_calib, visualise=True)
 
     # Generate segmentation masks for the mug to isolate the reconstruction from the background
     # seg_mask_list = generate_seg_masks(output_dir=data_path)
