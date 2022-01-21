@@ -30,13 +30,15 @@ I haven't explored these as it's difficult to estimate how much time it takes to
 The main() function demonstrates the usage of the code, and the class/function docstrings explain the reasoning behind
  the chosen approaches and their implementation details.
 """
+import logging
+from copy import copy
+from itertools import combinations
+from typing import List, Tuple
+
 import cv2
 import open3d as o3d
 import numpy as np
-
-from copy import copy
-from time import sleep
-from itertools import combinations
+import numpy.typing as npt
 import matplotlib.pyplot as plt
 
 from scipy.spatial.transform import Rotation
@@ -44,14 +46,10 @@ from scipy.optimize import least_squares
 from scipy.sparse import lil_matrix
 from tqdm import tqdm
 
-import numpy.typing as npt
-from typing import List, Tuple
-
 
 class PointCloudAligner(object):
-    """
-    Takes color images, depth maps and camera positions and creates an aligned reprojection of pointcloud fragments
-    """
+    """Takes color images, depth maps and camera positions and creates an aligned reprojection
+    of pointcloud fragments"""
     def __init__(self, cam_calib: o3d.camera.PinholeCameraIntrinsic) -> None:
         """
         Inits a PointCloudAligner with camera calibration parameters.
@@ -86,8 +84,6 @@ class PointCloudAligner(object):
         Returns:
             Reprojected and transformed pointcloud.
         """
-        _image = o3d.geometry.Image(image)
-        _depth_map = o3d.geometry.Image(depth_map)
         depth_image = o3d.geometry.RGBDImage.create_from_color_and_depth(color=o3d.geometry.Image(image),
                                                                          depth=o3d.geometry.Image(depth_map),
                                                                          depth_scale=1000, depth_trunc=0.6,
@@ -143,7 +139,7 @@ class PointCloudAligner(object):
 
 
 def reconstruct(pose_mat: npt.NDArray[np.float64], rot_mat: npt.NDArray[np.float64], color_img_list: List[str],
-                depth_img_list: List[str], cam_calib: o3d.geometry.PointCloud,
+                depth_img_list: List[str], cam_calib: o3d.geometry.PointCloud, c_icp: bool = False,
                 visualise: bool = False) -> o3d.geometry.PointCloud:
     """
     Feeds images and corresponding position data to a PointCloudAligner object to reconstruct a scene using the
@@ -155,6 +151,7 @@ def reconstruct(pose_mat: npt.NDArray[np.float64], rot_mat: npt.NDArray[np.float
         color_img_list: List of strings to the paths of the color images
         depth_img_list: List of strings to the paths of the depth images
         cam_calib: Intrinsic camera calibration parameters without distortions
+        c_icp: perform colored icp alignment of the pointcloud to the rest of the pointclouds
         visualise: Open a window and visualise the resulting pointcloud
 
     Returns:
@@ -162,122 +159,85 @@ def reconstruct(pose_mat: npt.NDArray[np.float64], rot_mat: npt.NDArray[np.float
     """
     aligner = PointCloudAligner(cam_calib=cam_calib)
     pcd = o3d.geometry.PointCloud()
+    full_pcd = o3d.geometry.PointCloud()
 
     for i, (color_path, depth_path) in enumerate(zip(color_img_list, depth_img_list)):
         color = cv2.imread(color_path, cv2.IMREAD_COLOR)
         depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
 
         pcd = aligner.reproject(image=color, depth_map=depth, rotation=rot_mat[i, :], translation=pose_mat[i, :])
+
+        full_pcd += pcd
+
+        if c_icp:
+            pcd = color_icp(full_pcd, pcd)
+
         if visualise:
             aligner.visualise(pcd)
 
     if visualise:
         aligner.vis.run()
 
-    return pcd
+    return full_pcd
 
 
-def color_icp():
-    def get_remy_pcd(i, cam_calib, pose_mat, rot_mat):
-        t_mtx = np.identity(4)
-        t_mtx[:3, :3] = o3d.geometry.get_rotation_matrix_from_axis_angle(rot_mat[i, :])
-        t_mtx[:3, 3] = pose_mat[i, :]
-        color = cv2.imread(f'/home/attila/Datasets/Remy/rgb-{str(i).zfill(5)}.png', cv2.IMREAD_COLOR)
-        depth = cv2.imread(f'/home/attila/Datasets/Remy/depth-{str(i).zfill(5)}.png', cv2.IMREAD_UNCHANGED)
-        image = o3d.geometry.Image(color)
-        depth_map = o3d.geometry.Image(depth)
-        depth_image = o3d.geometry.RGBDImage.create_from_color_and_depth(color=o3d.geometry.Image(image),
-                                                                         depth=o3d.geometry.Image(depth_map),
-                                                                         depth_scale=1000, depth_trunc=0.6,
-                                                                         convert_rgb_to_intensity=True)
-        pcd = o3d.geometry.PointCloud.create_from_rgbd_image(image=depth_image,
-                                                             intrinsic=cam_calib)
-        pcd.transform(t_mtx)
+def color_icp(pcd_target: o3d.geometry.PointCloud, pcd_align: o3d.geometry.PointCloud) -> o3d.geometry.PointCloud:
 
-        return pcd
+    voxel_radiuses = [0.04, 0.02, 0.01]
+    max_iters = [50, 30, 14]
+    transformation = np.identity(4)
 
-    """Register each new RGBD frame with colored ICP to the existing pointcloud"""
-    cam_calib = o3d.camera.PinholeCameraIntrinsic(width=640, height=480,
-                                                  fx=613.688, fy=614.261,
-                                                  cx=323.035, cy=242.229)
-
-    vis = o3d.visualization.Visualizer()
-    vis.create_window()
-
-    voxel_radius = [0.04, 0.02, 0.01]
-    max_iter = [50, 30, 14]
-    current_transformation = np.identity(4)
-
-    pose_data = np.genfromtxt('/home/attila/Datasets/Remy/scanner.log', delimiter=' ', usecols=range(2, 8))
-    rot_mat = pose_data[:, 3:]
-    pose_mat = pose_data[:, 0:3]
-
-    # Load im 0 as target
-    start = 0
-    pcd_target = get_remy_pcd(start, cam_calib, pose_mat, rot_mat)
-    icp_transforms = [np.identity(4)] * 195
-    vis.add_geometry(pcd_target, reset_bounding_box=True)
-
-    # Load each image sequentially and calculate the transformation with ICP
-    for i in range(start, 195):
-        pcd_move = get_remy_pcd(i, cam_calib, pose_mat, rot_mat)
-        #pcd_move.transform(icp_transforms[i-1])
-        try:
-            for scale in range(3):
-                iter = max_iter[scale]
-                radius = voxel_radius[scale]
-                source_down = pcd_move.voxel_down_sample(radius)
+    try:
+        if len(pcd_target.points) > 0:
+            for voxel_radius, max_iter in zip(voxel_radiuses, max_iters):
+                radius = voxel_radius
+                source_down = pcd_align.voxel_down_sample(radius)
                 target_down = pcd_target.voxel_down_sample(radius)
-                source_down.estimate_normals(
-                    o3d.geometry.KDTreeSearchParamHybrid(radius=radius * 2, max_nn=30))
-                target_down.estimate_normals(
-                    o3d.geometry.KDTreeSearchParamHybrid(radius=radius * 2, max_nn=30))
+                source_down.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=radius * 2, max_nn=30))
+                target_down.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=radius * 2, max_nn=30))
                 result_icp = o3d.pipelines.registration.registration_colored_icp(
-                    source_down, target_down, radius, current_transformation,
+                    source_down, target_down, radius, transformation,
                     o3d.pipelines.registration.TransformationEstimationForColoredICP(),
                     o3d.pipelines.registration.ICPConvergenceCriteria(relative_fitness=1e-6,
                                                                       relative_rmse=1e-6,
-                                                                      max_iteration=iter))
-                current_transformation = result_icp.transformation
-        except RuntimeError:
-            # Open3d raises a RuntimeError exception if there are not enough points to perform the ICP.
-            # In this case we default to an identity transformation
-            current_transformation = np.identity(4)
+                                                                      max_iteration=max_iter))
+                transformation = result_icp.transformation
+    except RuntimeError:
+        # Open3d raises a RuntimeError exception if there are not enough points to perform the ICP.
+        # In this case we default to an identity transformation
+        transformation = np.identity(4)
 
-        # Convert the rotation matrix to axis-angle and calculate the rotation angle in degrees.
-        # ICP should only slightly modify the angle, therefore if the calculated rotation angle is large,
-        # it's probably incorrect and better to discard it entirely.
-        angle = np.linalg.norm(Rotation.from_matrix(copy(current_transformation)[:3, :3]).as_rotvec(degrees=True))
-        print(angle)
-        if angle < 4:
-            pcd_move.transform(current_transformation)
-            icp_transforms[i] = current_transformation @ icp_transforms[i - 1]
+    # Convert the rotation matrix to axis-angle and calculate the rotation angle in degrees.
+    # ICP should only slightly modify the angle, therefore if the calculated rotation angle is large,
+    # it's probably incorrect and better to discard it entirely.
+    angle = np.linalg.norm(Rotation.from_matrix(copy(transformation)[:3, :3]).as_rotvec(degrees=True))
+    # Basic sanity check - the icp shouldn't require large magnitude rotations
+    if angle < 5:
+        pcd_align.transform(transformation)
 
-        pcd_target = pcd_move
-
-        vis.add_geometry(pcd_move, reset_bounding_box=True)
-        vis.poll_events()
-        vis.update_renderer()
-        sleep(0.01)
-
-    vis.run()
+    return pcd_align
 
 
 class KeypointTracker(object):
     """
-
+    Extracts keypoints from images and matches them using different strategies
     """
-    def __init__(self, ) -> None:
-
+    def __init__(self) -> None:
+        """Initialises the object"""
         self.mappoints = np.empty(shape=(0, 3))
         self.observations = np.empty(shape=(0, 4))
 
     @staticmethod
     def _track_keypoints(img_list: List[str]) -> Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
         """
+        Extracts keypoints from each image and tracks them sequentially across multiple consecutive frames
 
-        :param img_list:
-        :return:
+        Args:
+            img_list: List of strings to the paths of the color images
+
+        Returns:
+            observations: nx4 array of mappoint-keypoint correspondences. [mappoint_id, image_id, x, y]
+            mappoints: nx3 array of zeros that represent the future 3D coordinates of the tracked points.
         """
         # Generate key points and descriptors with ORB for all images and store in a list of dictionaries
         length = len(img_list)
@@ -359,13 +319,20 @@ class KeypointTracker(object):
         return observations, mappoints
 
     @staticmethod
-    def _extract_keypoints(img_list):
+    def _extract_keypoints(img_list: List[str]) -> Tuple[npt.NDArray[np.float64], List[int]]:
+        """
+        Extracts keypoints from each image
+
+        Args:
+            img_list: List of strings to the paths of the color images
+
+        Returns:
+            keypoints: keypoint coordinates in images
+            kp_starts: helper list for the next method that analyses the keypoints
+        """
         # Generate key points and descriptors with ORB for all images and store in a list of dictionaries
         length = len(img_list)
         orb = cv2.ORB_create()
-
-        # features = [{'key_points': [],
-        #             'descriptors': np.empty((0, 32))} for i in range(length)]  # Initialise a list of dictionaries
 
         # im_no, x, y, des
         keypoints = np.empty(shape=(0, 35))
@@ -376,8 +343,6 @@ class KeypointTracker(object):
             kp = orb.detect(color, None)
             kp, des = orb.compute(color, kp)
 
-            # features[i]['key_points'] = list(kp)
-
             keypoints = np.vstack([keypoints, np.hstack([i * np.ones(shape=(len(kp), 1)),
                                                          np.array([p.pt for p in kp]),
                                                          des])])
@@ -386,15 +351,28 @@ class KeypointTracker(object):
         return keypoints, kp_starts
 
     @staticmethod
-    def _match_keypoints(keypoints, kp_starts, show_matches=False):
+    def _match_keypoints(keypoints: npt.NDArray[np.float64], kp_starts: List[int],
+                         window: int) -> Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+        """
+        Matches keypoint descriptors between images in the specified window.
+
+        Args:
+            keypoints: Keypoint coordinates in images.
+            kp_starts: List that stores the first keypoint row id in keypoints for each image index.
+            window: Image index window in which keypoints are matched.
+
+        Returns:
+            observations: nx4 array of mappoint-keypoint correspondences. [mappoint_id, image_id, x, y]
+            mappoints: nx3 array of zeros that represent the future 3D coordinates of the tracked points.
+        """
         length = len(kp_starts) - 1
 
         # Match keypoints exhaustively with a brute force matcher
         mappoints = np.empty(shape=(0, 3))  # Store the initial point position estimates
         # Store the observed mappoint id and observing image no with keypoint x, y coordinates
         observations = np.empty(shape=(0, 4))
-        for i in tqdm(range(0, length - 10), desc='Keypoint matching'):
-            for j in range(i + 1, i + 11):
+        for i in tqdm(range(0, length-window), desc='Keypoint matching'):
+            for j in range(i + 1, i+window+1):
                 bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
                 matches = bf.match(queryDescriptors=keypoints[kp_starts[i]: kp_starts[i + 1], 3:].astype(np.uint8),
                                    trainDescriptors=keypoints[kp_starts[j]: kp_starts[j + 1], 3:].astype(np.uint8))
@@ -412,13 +390,26 @@ class KeypointTracker(object):
                                                          np.array([j]),  # Compared to image id
                                                          keypoints[kp_starts[j] + match.trainIdx][1:3]])])  # x, y
 
-        # observations = np.array(sorted(observations, key=lambda x: (x[0])))  # Key: mappoint id
         observations = np.array(sorted(observations, key=lambda x: (x[1], x[2], x[3])))
         return observations, mappoints
 
     @staticmethod
-    def _triangulate_mappoints(observations, cam_calib, mappoints, pose_mat, rot_mat):
+    def _triangulate_mappoints(observations: npt.NDArray[np.float64], mappoints: npt.NDArray[np.float64],
+                               cam_calib: o3d.camera.PinholeCameraIntrinsic, pose_mat: npt.NDArray[np.float64],
+                               rot_mat: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+        """
+        Calculate the approximate position of mappoints using the camera position priors.
 
+        Args:
+            observations: nx4 array of mappoint-keypoint correspondences. [mappoint_id, image_id, x, y].
+            mappoints: nx3 array of zeros that represent the future 3D coordinates of the tracked points.
+            cam_calib: Intrinsic camera calibration parameters without distortions.
+            pose_mat: nx3 array of translation vectors.
+            rot_mat: nx3 array of rotation vectors in axis-angle representation. Rotation angle equals to vector norm.
+
+        Returns:
+            mappoints: nx3 array of the approximate 3D coordinates of the tracked points.
+        """
         for mappoint in tqdm(np.unique(observations[:, 0]), desc='Triangulating mappoints'):
             position = np.empty(shape=(0, 3))
             for obs1, obs2 in combinations(observations[observations[:, 0] == mappoint], r=2):
@@ -444,31 +435,36 @@ class KeypointTracker(object):
         return mappoints
 
     def compute_points(self, pose_mat: npt.NDArray[np.float64], rot_mat: npt.NDArray[np.float64],
-                       color_img_list: List[str], cam_calib: o3d.camera.PinholeCameraIntrinsic, method: str,
-                       visualise: bool = False) -> Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+                       color_img_list: List[str], cam_calib: o3d.camera.PinholeCameraIntrinsic,
+                       method: str, window: int = 0) -> Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
         """
+        Computes the mappoints and observations for the bundle adjustment.
 
-        :param pose_mat:
-        :param rot_mat:
-        :param color_img_list:
-        :param cam_calib:
-        :param method:
-        :param visualise:
-        :return:
+        Args:
+            pose_mat: nx3 array of translation vectors.
+            rot_mat: nx3 array of rotation vectors in axis-angle representation. Rotation angle equals to vector norm.
+            color_img_list: List of strings to the paths of the color images
+            cam_calib: Intrinsic camera calibration parameters without distortions.
+            method: The method of keypoint matching, either 'local_tracking' or 'window_matching'. Window_matching
+             uses descriptor based matching and doesn't work well for this scene.
+
+        Returns:
+            observations: nx4 array of mappoint-keypoint correspondences. [mappoint_id, image_id, x, y].
+            mappoints: nx3 array of the approximate 3D coordinates of the tracked points.
         """
         # Extract keypoints
         if method == 'local_tracking':
             _observations, _mappoints = self._track_keypoints(img_list=color_img_list)
-        elif method == 'global_matching':
+        elif method == 'window_matching':
             _keypoints, _kp_starts = self._extract_keypoints(img_list=color_img_list)
-            _observations, _mappoints = self._match_keypoints(keypoints=_keypoints, kp_starts=_kp_starts)
+            _observations, _mappoints = self._match_keypoints(keypoints=_keypoints, kp_starts=_kp_starts, window=window)
         else:
             raise NotImplementedError('Method not implemented. Please choose either \'local_tracking\' or '
                                       '\'global_matching\'')
 
         # Triangulate mappoints
         _mappoints = self._triangulate_mappoints(observations=_observations, cam_calib=cam_calib, mappoints=_mappoints,
-                                          pose_mat=pose_mat, rot_mat=rot_mat)
+                                                 pose_mat=pose_mat, rot_mat=rot_mat)
 
         self.mappoints = _mappoints
         self.observations = _observations
@@ -477,34 +473,51 @@ class KeypointTracker(object):
 
 
 class BundleAdjustment(object):
+    """Use bundle adjustment to refine the initial camera pose estimates. Bunde adjustment requires initial estimates
+     of the independent variables, which are the
+        - 6DOF Camera position estimates and calibration parameters
+        - 3D positions of the mappoints
+
+     These variables are optimised jointly my minimising the projection error of the mappoints compared to the
+     observed positions of the keypoints in various images.
+
+    To obtain an initial estimate of the mappoints, keypoints are detected in the images and matched by using one
+     of two strategies. For each observation the initial mappoint position is calculated by triangulation.
+
+    In the bundle adjustment stage, mappoints are projected onto the images that observed that given mappoint.
+     A residual value is calculated for each observation by subtracting the projection coordinates from
+     the measured (keypoint) coordinates. The residual values are stored in a sparse matrix, for which the Jacobians
+     (first order partial derivatives) are calculated. We use Scipy's least squares optimisation function to optimize
+     the inputs, the camera parameters and the mappoint locations."""
     def __init__(self):
+        """Initialises the bundle adjustment object"""
         self.pose_mat = np.empty(shape=(0, 3))
         self.rot_mat = np.empty(shape=(0, 3))
 
     @staticmethod
-    def _jacobian_sparsity(observations):
-        """
-        Calculate which elements of the Jacobian matrix are non-zero
+    def _jacobian_sparsity(observations: npt.NDArray[np.float64]) -> lil_matrix:
+        """Calculate which elements of the Jacobian matrix are non-zero
 
-        :param n_cameras:
-        :param n_points:
-        :param camera_indices:
-        :param point_indices:
-        :return:
+        Args:
+            observations: nx4 array of mappoint-keypoint correspondences. [mappoint_id, image_id, x, y]
+
+        Returns:
+            sparsity_matrix: A sparse matrix with non-zero elements where the Jacobians will be non-zero during
+             optimization
         """
 
         n_cameras = np.max(observations[:, 1], axis=0) + 1
         n_points = np.max(observations[:, 0], axis=0) + 1
-        n_keypoints = observations.shape[0]
+        n_observations = observations.shape[0]
 
-        m = int(n_keypoints * 2)
+        m = int(n_observations * 2)
         n = int(n_points*3 + n_cameras*6)
         sparsity_matrix = lil_matrix((m, n), dtype=int)
 
-        for i, keypoint in enumerate(observations):
+        for i, observation in enumerate(observations):
             kp_row_id = i*2
-            point_col_id = int(keypoint[0]*3)
-            camera_col_id = int(n_points*3 + keypoint[1]*6)
+            point_col_id = int(observation[0]*3)
+            camera_col_id = int(n_points*3 + observation[1]*6)
 
             # Set mappoint involved in the observation
             sparsity_matrix[kp_row_id: kp_row_id+2, point_col_id: point_col_id+3] = 1
@@ -514,15 +527,20 @@ class BundleAdjustment(object):
         return sparsity_matrix
 
     @staticmethod
-    def _project_points(x_params, observations, cam_calib):
+    def _project_points(x_params: npt.NDArray[np.float64], observations: npt.NDArray[np.float64],
+                        cam_calib: o3d.camera.PinholeCameraIntrinsic) -> npt.NDArray[np.float64]:
         """This function calculates the residual projection error values for each mappoint-image observation pair
 
-        x_params is an (n,) shaped input array containing the parameters to be optimised, which are
-          - 3D positions of the mappoints
-          - 6DOF positions of the cameras
+        Args:
+            x_params: nx1 shaped input array containing the flattened parameters to be optimised, which are
+              - 3D positions of the mappoints
+              - 6DOF positions of the cameras
+            observations: nx4 array of mappoint-keypoint correspondences. Required to parse x_params and stores the
+             measured values tat is used to calculate the projection residuals. [mappoint_id, image_id, x, y]
+            cam_calib: Intrinsic camera calibration parameters without distortions
 
-        n_cameras and n_points parameters are used to parse x_params, while obsrv contains the measured observations
-         of the mappoints that are used to calculate the residual values.
+        Returns:
+            res: Array of projection residuals for each available observation measurement
         """
 
         # For each camera, project the observed mappoints and calculate the residual values.
@@ -555,36 +573,35 @@ class BundleAdjustment(object):
             measured_points = np.vstack([measured_points, observing_keypoints[:, 2:]])
 
         # Return a flattened array of difference between projection coordinates
-        ret = (projected_points - measured_points).ravel()
-        return ret
+        res = (projected_points - measured_points).ravel()
+        return res
 
     def refine_poses(self, pose_mat: npt.NDArray[np.float64], rot_mat: npt.NDArray[np.float64],
                      cam_calib: o3d.camera.PinholeCameraIntrinsic, mappoints: npt.NDArray[np.float64],
                      observations: npt.NDArray[np.float64]) -> Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
-        """
-        Use bundle adjustment to refine the initial camera pose estimates. Bunde adjustment requires initial estimates of
-         the independent variables, which are the
-           - 6DOF Camera position estimates and calibration parameters
-           - 3D positions of the mappoints
+        """Use bundle adjustment to refine camera poses and return the updated pose and rotation information.
 
-         - Observations of the mappoints as keypoints in images
+        Performance is extremely dependent on the correctness of the majority of keypoint correspondences. Can also
+         estimate camera calibration paraeters if only approximate values are available. This is not used in this case
+         to help the convergence by providing additional constraints, however a bundle adjustment backed reconstruction
+         is typically more accurate if camera calibration parameters are estimated independently of each other, even if
+         the images has been recorded with the same camera. The reason for this is that not all camera parameters can
+         be estimated always and slightly different camera calibrations models fit the data better for various keypoint
+         coordinate distributions.
 
-        To obtain an initial estimate of the mappoints, keypoints are detected in the images and matched by descriptor
-        values. The matches are then merged to create a list of points observed by a list of keypoints each. For each
-        observation the mappoint position is calculated using the depth information and is averaged (excluding 0.0 values
-        meaning depth information is not present).
+        Args:
+            pose_mat: nx3 array of translation vector priors.
+            rot_mat: nx3 array of rotation vector priors in axis-angle representation. Rotation angle equals to vector
+             norm.
+            cam_calib: Intrinsic camera calibration parameters without distortions.
+            observations: nx4 array of mappoint-keypoint correspondences. [mappoint_id, image_id, x, y].
+            mappoints: nx3 array of the approximate 3D coordinates of the tracked points.
 
-        In the bundle adjustment stage, mappoints are projected onto the images that observed that given mappoint.
-        A residual value is calculated for each observation by subtracting the projection coordinates from
-        the measured (keypoint) coordinates. The residual values are stored in a sparse matrix, for which the Jacobians
-        (first order partial derivatives) are calculated. We use Scipy's least squares optimisation function to optimize
-        the inputs, the camera parameters and the mappoint locations.
+        Returns:
+            pose_mat: Refined nx3 array of translation vectors
+            rot_mat: Refined nx3 array of rotation vectors in axis-angle representation. Rotation angle equals to vector
+             norm.
 
-        :param rot_mat:
-        :param pose_mat:
-        :param color_img_list:
-        :param cam_calib:
-        :return:
         """
         # Calculate jacobian sparsity structure to be able to fit the Jacobian matrix in memory
         sp_mtx = self._jacobian_sparsity(observations=observations)
@@ -605,57 +622,72 @@ class BundleAdjustment(object):
         return self.pose_mat, self.rot_mat
 
 
-def get_better_depthmaps(imgpairs, baseline):
-    """According to https://www.mouser.com/pdfdocs/Intel_D400_Series_Datasheet.pdf the Intel D435 has
-    50mm stereo baseline"""
+def get_better_depthmaps(imgpairs: List[Tuple[str, str]], baseline: float = 50, focal_length: float = 1.63,
+                         save_dir: str = None, show: bool = False, compare: List[str] = None) -> List[str]:
+    """Generate depthmaps using the stereo IR images.
 
-    for left_path, right_path in imgpairs:
+    Calculates depth map using known camera baseline and focal length from disparity map. Disparity map is obtained by
+     block-matching.
+
+    The structured infrared lighting provides good texture for stereo block matching, however it doesn't seem to
+     outperform the existing method that the camera uses to generate the depthmaps.
+
+    Args:
+        imgpairs: Tuple of two lists storing the image paths to the left and right stereo images respectively.
+        baseline: Stereo baseline in metres.
+        focal_length: Focal length of the camera lens in pixels.
+        save_dir: Directory to save the depth maps. If not given, depth maps are not saved.
+        show: Show depth maps with matplotlib.
+        compare: Original depthmaps to cpmpare to
+
+    Returns:
+        Depth_img_list: a list of image paths where the depth images were saved.
+    """
+    new_depth_paths = []
+
+    for i, (left_path, right_path) in enumerate(imgpairs):
         left = cv2.imread(left_path, cv2.IMREAD_GRAYSCALE)
         right = cv2.imread(right_path, cv2.IMREAD_GRAYSCALE)
-        depth_map = cv2.imread('/home/attila/Datasets/Remy/depth-00050.png', cv2.IMREAD_UNCHANGED)
-        depth_map[depth_map > 1e+3] = 0
 
-        c = cv2.vconcat([left, right])
-
-        #cv2.imshow('disparity', c)
-        #cv2.imshow('disparity', right)
-        #cv2.waitKey(100000)
-
-        fx = 1.93  # lense focal length
-        baseline = 50  # distance in mm between the two cameras
-        disparities = 128  # num of disparities to consider
-        block = 31  # block size to match
-        units = 0.001  # depth units
+        disparities = 128  # max disparity search window
+        block = 31  # matching block size
 
         stereo = cv2.StereoBM_create(numDisparities=disparities, blockSize=block)
         disparity = stereo.compute(left, right)
         depth = np.zeros(shape=left.shape).astype(float)
-        depth[disparity > 0] = (fx * baseline) / (units * disparity[disparity > 0])
+
+        depth[disparity > 0] = focal_length * baseline / disparity[disparity > 0]
+
+        # Clip at 1m
         depth[depth > 1e+3] = 0
 
+        if show:
+            fig, axs = plt.subplots(1, 2, sharex=True, sharey=True)
+            compare_to = cv2.imread(compare[i], cv2.IMREAD_UNCHANGED)
+            # Clip at 1m
+            compare_to[compare_to > 1e+3] = 0
+            axs[0].imshow(depth)
+            axs[1].imshow(compare_to)
+            plt.show()
 
-        fig, axs = plt.subplots(1, 2, sharex=True, sharey=True)
-        # Remove horizontal space between axes
-        #fig.subplots_adjust(vspace=0)
+        if save_dir:
+            path = f'{save_dir}/new_depth-{str(i).zfill(5)}.png'
+            cv2.imwrite(path, depth, cv2.IMWRITE_PNG_STRATEGY_DEFAULT)
+            new_depth_paths.append(path)
 
-        # Plot each graph, and manually set the y tick values
-        axs[0].imshow(depth_map)
-        axs[1].imshow(depth)
-        plt.show()
-
-
-        #disparity = ((disparity + np.min(disparity)) / np.max(disparity) * 255).astype(np.uint8)
-        #cv2.imshow('disparity', disparity)
-        #cv2.waitKey(1000)
+    return new_depth_paths
 
 
 def main():
-    # Data dir with '/' at the end
+    """
+    Main function that demonstrates the usage of this module.
+    """
+    # Data dir
     data_path = '/home/attila/Datasets/Remy'
 
     # Change dataset limits or stride if needed
     start = 0
-    end = 195
+    end = 100
     step = 1
 
     # Parse scanner log and load position and rotation data
@@ -675,29 +707,46 @@ def main():
                                                   cx=323.035, cy=242.229)
 
     # Perform an initial reconstruction with the provided data and inspect results
-    #reconstruct(pose_mat, rot_mat, color_img_list, depth_img_list, cam_calib=cam_calib, visualise=True)
+    reconstruct(pose_mat, rot_mat, color_img_list, depth_img_list, cam_calib=cam_calib, c_icp=False, visualise=True)
+
+    """According to https://www.mouser.com/pdfdocs/Intel_D400_Series_Datasheet.pdf the Intel D435 has
+    50mm stereo baseline"""
 
     # Process stereo images, create better depth maps and inspect results
-    #depth_img_list = get_better_depthmaps(zip(ir1_img_list, ir2_img_list), baseline=0.05)
-    #reconstruct(pose_mat, rot_mat, color_img_list, depth_img_list, visualise=True)
+    new_depth_img_list = get_better_depthmaps(list(zip(ir1_img_list[:1], ir2_img_list[:1])), baseline=50,
+                                              focal_length=6113, show=True, compare=depth_img_list[:1])
+
+    """Since the new depth maps are not significantly better than the original data and the calibration from the IR
+    cameras to color camera wasn't provided, the original depth maps are used in the rest of the script."""
 
     # Refine camera poses with ORB features and bundle adjustment
     tracker = KeypointTracker()
     observations, mappoints = tracker.compute_points(pose_mat=pose_mat, rot_mat=rot_mat, color_img_list=color_img_list,
-                                                     cam_calib=cam_calib, method='global_matching', visualise=False)
+                                                     cam_calib=cam_calib, method='local_tracking')
 
     ba = BundleAdjustment()
     new_pose_mat, new_rot_mat = ba.refine_poses(pose_mat=pose_mat, rot_mat=rot_mat, mappoints=mappoints,
                                                 observations=observations, cam_calib=cam_calib)
 
-    print(np.linalg.norm(pose_mat - new_pose_mat, axis=1))
-    print(np.linalg.norm(rot_mat - new_rot_mat, axis=1))
+    pcd = reconstruct(new_pose_mat, new_rot_mat, color_img_list, depth_img_list, cam_calib, visualise=True, c_icp=False)
 
-    reconstruct(new_pose_mat, new_rot_mat, color_img_list, depth_img_list, cam_calib, visualise=True)
+    # Try color icp
+    pcd = reconstruct(new_pose_mat, new_rot_mat, color_img_list, depth_img_list, cam_calib, visualise=True, c_icp=True)
 
-    # Perform color ICP on the final pointcloud to improve the model
-    #color_icp()
+    # Generate mesh
+    logging.info('Estimating normals')
+    pcd.estimate_normals()
+    logging.info('Generating mesh')
+    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd=pcd, depth=8)
 
+    o3d.visualization.draw_geometries([mesh])
+
+    # Export result
+    logging.info('Exporting results')
+    o3d.io.write_triangle_mesh(filename='mesh.ply', mesh=mesh)
+    o3d.io.write_point_cloud(filename='pcd.ply', pointcloud=pcd)
+
+    logging.info('Done.')
 
 if __name__ == '__main__':
     main()
